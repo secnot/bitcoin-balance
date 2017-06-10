@@ -1,196 +1,182 @@
 from collections import deque, defaultdict, namedtuple
-from .storage import Session, get_or_create, make_session_scope, AddressBalance
+import threading
+import time
 
-OP_RECEIVED = 1
-OP_SPENT    = 2
-TxoRecord = namedtuple('UtxoRecord', ['op_type', 'txo', 'height'])
+from .exceptions import BacktrackError
+from .primitives import COINBASE_TX, bitcoin_to_string
+from .storage import MemoryBalanceStorage, SQLBalanceStorage, BalanceProxyCache
+from .settings import Settings
 
 
-COINBASE_TX = '0'*64
+TxoRecord = namedtuple('TxoRecord', ['tx', 'value', 'height'])
 
+
+from bitcoin.core import str_money_value, b2lx, b2x, x
+
+
+
+def block_record_iter(block):
+    """Iterate through block inputs and outputs"""
+    address_total = 0
+    address_discovered = False
+    
+    # First add new unspent outputs so balance is positive
+    for vout in block.vout:
+        if not vout.addr:
+            continue
+        
+        yield (vout.addr, TxoRecord(vout.tx, vout.value, block.height))
+
+    # Spend outputs
+    for vin in block.vin:
+        if not vin.addr or vin.tx==COINBASE_TX:
+            continue
+
+        yield (vin.addr, TxoRecord(vin.tx, -vin.value, block.height))
+
+
+#
+# TODO: Add self._update_lock to wrap add_block and backtrack while still
+# allowing balance get requests
+#########################################################################3
 class BalanceProcessor(object):
 
-    
-    def __init__(self, backtrack_limit=100):
+
+    def __init__(self, backtrack_limit=100, storage=None):
+        """
+        Arguments:
+            storage (BalanceProxyCache):
+        """
+
+        # 
         self._blocks = deque()
 
-        # Accumulated balance up to the oldest tracked block
-        self._address_balance = defaultdict(int)
-       
-        # records per address  in the las N blocks (using list
-        # instead of deque to save memory)
-        self._address_records = defaultdict(list)
+        # Last time a block was added
+        self._last_block_time = time.perf_counter()
 
-        # Max number of blocks with full records
+        # Max number of block being tracked
         self._backtrack_limit = backtrack_limit
-        
-        self._db_session = Session
 
+        # Address balance permanent storage
+        self._storage = storage
 
+        # Accumulated address balance for the blocks not yet placed into storage
+        self._pending_balance = defaultdict(int)
+
+        # Operation records for the blocks not yet stored, (by address)
+        self._pending_records = defaultdict(deque)
+
+        # Main lock
+        self._lock = threading.Lock()
+
+ 
     def _add_record(self, address, record):
         """Add transaction record to address"""
-        self._address_records[address].append(record)
-       
-        with make_session_scope(self._db_session) as session:
-            balance, created = get_or_create(session, 
-                    AddressBalance, defaults= {'balance': 0}, address=address)
-             
-            if record.op_type == OP_RECEIVED:
-                balance.balance = balance.balance + record.txo.value
-                #self._address_balance[address] += record.txo.value
-            else:
-                balance.balance = balance.balance - record.txo.value
-                #self._address_balance[address] -= record.txo.value
-       
-            if balance.balance == 0:
-                if created:
-                    session.expunge(balance)
-                else:
-                    session.delete(balance)
-
-        assert balance.balance >= 0
-
-        #balance.balance=12
-        #session = self._db_session()
-        #ubalance = AddressBalance(address=address, balance=new_balance)
-        #session.merge(balance)
-        #session.commit()
-
-        # Don't keep balance if it is 0
-        #if self._address_balance[address] == 0:
-        #    del self._address_balance[address]
-
-    def _del_record(self, address, height):
-        """Remove from address all records equal or smaller"""
-        if address not in self._address_records:
+        self._pending_records[address].append(record)
+        self._pending_balance[address] += record.value
+      
+        # Cleanup
+        if not self._pending_balance[address]:
+            del self._pending_balance[address]
+        
+    def _del_record(self, address, last=True):
+        """Remove first or last record for given address"""
+        if address not in self._pending_records:
             return
 
-        records = self._address_records[address]
-        while records and records[0].height <= height:
-            records.pop(0)
+        records = self._pending_records[address]
 
-        # If empty remove deque
+        record = records.pop() if last else records.popleft()
+
+        self._pending_balance[address] -= record.value
+ 
+        # Cleanup
         if not records:
-            del self._address_records[address]
+            del self._pending_records[address]
+        
+        if not self._pending_balance[address]:
+            del self._pending_balance[address]
 
-    def _remove_oldest_block(self):
-        """ """
-        block = self._blocks.popleft()
+    def add_block(self, block): 
+        """Add next block in the chain"""
+        # Add newest block 
+        with self._lock:
+            self._blocks.append(block) 
+       
+            for address, record in block_record_iter(block):
+                self._add_record(address, record)
 
-        # Remove all the records added by this block
-        for vout in block.vout:
-            if vout.addr:
-                self._del_record(vout.addr, block.height)
-
-        for vin in block.vin:
-            if vin.addr:
-                self._del_record(vin.addr, block.height)
-
-    def add_block(self, block):
-        """Update address balance with block utxo"""
-
+        # Commit oldest block to storage if the limit has been reached
         if len(self._blocks) > self._backtrack_limit:
-            self._remove_oldest_block()
+            with self._lock:
+                block = self._blocks.popleft()
+            
+                for address, record in block_record_iter(block):
+                    self._del_record(address, last=False)
+                    self._storage.update(address, record.value)
 
-        self._blocks.append(block) 
-    
-        # First add new unspent outputs so balance is positive
-        for vout in block.vout:
-            if not vout.addr or vout.value==0:
-                continue
+        # Determine if it's the best time for a storage commit
+        # more than 30000 pending updates or more than 30 seconds 
+        # since the last block. Doesn't need locking
+        now = time.perf_counter()
+        if len(self._storage) > 30000 or now-self._last_block_time>30:
+            self._storage.commit(self._blocks[0].height-1)
 
-            self._add_record(vout.addr, TxoRecord(OP_RECEIVED, vout, block.height))
-
-        # Spend outputs
-        for vin in block.vin:
-            if not vin.addr or vin.tx==COINBASE_TX:
-                continue
-           
-            self._add_record(vin.addr, TxoRecord(OP_SPENT, vin, block.height))
+        self._last_block_time = now
 
     def backtrack(self):
-        """Backtrack one block update"""
-        pass
-
-    @property
-    def top_block(self):
-        """Return top BlockRecord"""
-        if not self._last_blocks:
-            return None
-        else:
-            return self._last_blocks[-1]
-
-    @property
-    def top_block_height(self):
-        """Current blockchain height"""
-        if not self.top_block:
-            return -1
-        else:
-            return self.top_block.height
-
-    def _update_address_balance(self, block):
-        """
-        Update address balance with a new block positive value for new unspent
-        and negative value for spent.
-        """
-        assert isintance(utxo.addr, str)
-
-        try:
-            self._address_balance[utxo.addr] += utxo.amount
-            assert self._address_balance[utxo.addr] > 0
-        except KeyError:
-            assert utxo.value >= 0
-            self._address_balance[utxo.addr] = utxo_value
-
-
-    def _get_unconfirmed(self, address, confirmations):
-        """Return a list of unconfirmed 'movements' for the address
+        """Backtrack one block up to a max of backtrack_limit blocks"""
         
+        
+        if not self._blocks:
+            raise BacktrackError("Reached backtrack limit")
+
+        with self._lock:
+            block = self._blocks.pop()
+
+            for address, record in block_record_iter(block):
+                self._del_record(address, last=True)
+
+    def get_transactions(self, address, confirmations=0): 
+        """Return a list of the unconfirmed incoming/outgoing transactions.
+
         Arguments:
-            address (str): Wallet address
-            confirmations (int): Number of confirmations required for a 
-                movement (must be smallet than the number of tracked blocks
+            address (str): Bitcoin address
+            confirmations (int): Number of confirmations required for a transaction
+                to be considered confirmed (must be smalled than backtrack_limit)
 
         Returns:
-            List of (operation_type, utxo, confirmations)
-            
-            operation_type: RECEIVED|SPENT
-            utxo: TxOut
-            confirmations: int
+            (transaction_hash, value, block_height)
         """
-        if address not in self._address_utxo:
+        if address not in self._pending_records:
             return []
 
         # transactions from blocks lower than this height are confirmed
-        limit_height = self.top_block_height-confirmations
+        limit_height = self.height-confirmations
 
-        unconfirmed = []
+        unconfirmed = [] # Unconfirmed records
 
-        for record in reversed(self_address_utxo[addr]):
-            if record.height >= limit_height:
-                unconfirmed.append((op_type, utxo, self.top_block_height-record.height))
-            else:
-                # Because they are ordered as soon as there is one confirmed
-                # utxo the ones following must also be confirmed
-                break
+        with self._lock:
+            for record in reversed(self._pending_records[address]):
+                if record.height < limit_height:
+                    break
+
+                unconfirmed.append(record)
 
         return unconfirmed
 
-    def get_balance(self, address, confirmations):
-        """
-        Arguments:
-            address (string):
-            confirmations (int): Number of confirmations required to accept
-                the balance, any utxo
-        Returns:
-            (balance, [unconfirmed1, unconfirmed2, ...])
-        """
-        if confirmations < 0:
-            confirmations = 0
 
-        balance = self._address_balance.get(address, 0)
-        unconfirmed = self._get_unconfirmed(address, confirmations)
+    def get_balance(self, address):
+        """Return bitcoin address balance, can be called concurrently with:
+        commit, backtrack, and add_blok"""
+        with self._lock:
+            return self._storage.get(address)+self._pending_balance.get(address, 0)
 
-        return (balance, unconfirmed)
+    def commit(self):
+        """Force commit balance to storage"""
+        if self._blocks:
+            self._storage.commit(self._blocks[0].height-1)
 
-
+    @property
+    def height(self):
+        return self._blocks[-1].height if self._blocks else self._storage.height

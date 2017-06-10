@@ -1,8 +1,10 @@
 from collections import deque
+import multiprocessing
 import threading
 import time
 import logging
 import json
+import queue
 
 import bitcoin
 import bitcoin.rpc
@@ -10,94 +12,258 @@ from bitcoin.core import str_money_value, b2lx, b2x, x
 
 from .primitives import TxOut, Block, BlockFactory
 from .balance import BalanceProcessor
-from .exceptions import ChainError
+from .exceptions import ChainError, BacktrackError
 from .logger import LOGGING_FORMAT
-
-
-
-
-settings = {
-    # 
-    'MAX_BACKTRACK_BLOCKS': 100,
-
-    # Retry period for bitcoind connection
-    'BITCOIND_POLL_PERIOD': 0.01,
-
-    # Chain used by bitcoind 'testnet' or 'mainnet'
-    'BITCOIN_CHAIN': 'testnet',
-}
-
+from .storage import MemoryBalanceStorage, SQLBalanceStorage, BalanceProxyCache
+from .database import Session
+from .settings import Settings
+from .proxy import BitcoindProxy
 
 logging.basicConfig(format=LOGGING_FORMAT, level=logging.INFO)
 logger = logging.getLogger("Bitcoin")
 
-bitcoin.SelectParams(settings['BITCOIN_CHAIN'])
+bitcoin.SelectParams(Settings['BITCOIN_CHAIN'])
+
+
+
+# Cache size for pending blocks
+BLOCK_CACHE_SIZE = 10
+
+
+class BlockPrefetchingCache(object):
+    """BlockCache is a prefetching cache for sequential blockchain blocks"""
+
+    def __init__(self, height, proxy, cache_size=BLOCK_CACHE_SIZE):
+        """
+        Arguments:
+            height (int): Cache starting height, the first time 
+                get_next_block is successful this is the block it
+                will return.
+
+            proxy (proxy.BitcoindProxy|str): initialized BitcoindProxy or 
+                bitcoind_url string
+        """
+        if isinstance(proxy, BitcoindProxy):
+            self._proxy = proxy
+        else:
+            self._proxy = BitcoindProxy(proxy)
+
+        # Height for the next block to request from bitcoind
+        self._height = height
+
+        # Cached blocks
+        self._cache_size = cache_size
+        self._cache = queue.Queue(self._cache_size)
+
+        # lock polling while purging or setting new height
+        self._lock = threading.Lock()
+
+        # Event to signal threads to stop
+        self._stop_event = threading.Event()
+
+        # Launch polling thread
+        self._fetch_thread = threading.Thread(target=self._fetch_thread_func, 
+                                             daemon=False)
+        self._fetch_thread.start()
+
+
+    def _fetch_thread_func(self):
+        """Thread polling bitcoind looking for the next block"""
+        # height for the top blockchain block
+        blockchain_height = 1
+       
+        # Initialize height and cache for first iteration
+        with self._lock:
+            current_height = self._height - 1
+            cache = self._cache
+
+        # Flag the connection was lost
+        connection_lost = False
+        
+        # TODO: Log when connection to bitcoind is lost and recovered
+        while True:
+            # Check cache wasn't purged
+            with self._lock:
+                if id(cache) != id(self._cache):
+                    cache = self._cache
+                    current_height = self._height-1
+
+            # Did an exit signal arrive?
+            if self._stop_event.wait(timeout=0):
+                break
+           
+            # If we are not yet at the top of the blockchain, get the next block
+            # as fast as possible. If it is the top or the connection to bitcoind
+            # was lost, wait default poll period and check for new blocks.
+            if connection_lost or current_height >= blockchain_height:
+                stop = self._stop_event.wait(timeout=Settings['BITCOIND_POLL_PERIOD'])
+                if stop:
+                    break
+
+            
+            with self._proxy as proxy:
+
+                # Already at the top, are there new blocks????
+                if current_height >= blockchain_height:
+                    try:
+                        blockchain_height = proxy.get_blockcount()
+                        connection_lost = False
+                        if current_height >= blockchain_height:
+                            continue
+                    except ConnectionError:
+                        connection_lost = True
+                        continue
+
+
+                # Request the next block in the sequence
+                try:
+                    cblock = proxy.get_block(current_height+1)
+                    connection_lost = False
+                except ConnectionError:
+                    connection_lost = True
+                    continue
+
+            # try to add the block at the end of the cache for a reasonable
+            # amount of time, if it fails discard it and try again later.
+            while True:
+                try:
+                    cache.put((current_height, cblock), timeout=3)
+                    current_height +=1
+                    break
+                except queue.Full:
+                    pass
+            
+                if self._stop_event.wait(timeout=0):
+                    break
+                
+        # Clean up before exiting
+        self._proxy.stop()
+
+
+    def set_height(self, height):
+        """Purge current cache and start caching at a different height"""
+        new_cache = queue.Queue(self._cache_size)
+        with self._lock: 
+            old_cache = self._cache
+            self._cache = new_cache
+            self._height = height
+
+        # Purge all blocks from the old cache and fill it with None
+        # to assure there isn't a get_next_block call stuck
+        while True:
+            try:
+                old_cache.get(block=False)
+            except queue.Empty:
+                break
+
+        while True:
+            try:
+                old_cache.put((None, None), block=False)
+            except queue.Full:
+                break
+
+    def get_next_block(self, block=True, timeout=None):
+        """Get the next block in the chain
+        
+        Arguments:
+            block (bool): Block if necessary until an item is available
+            timeout (int|None): If timeout is a positive number, it blocks at 
+                most timeout seconds and raises the Empty exception if no item 
+                was available within that time
+        
+        Exceptions:
+            queue.Empty
+
+        Returns:
+            (int, cBlock)-> block height and block tuple
+        """
+        while True:
+            cache = self._cache
+
+            height, cblock = cache.get(block, timeout)
+            if cblock is None:
+                continue
+       
+            # the previous get call could have blocked for a long time,
+            # check cache wasn't purged meanwhile
+            if id(cache) != id(self._cache):
+                continue
+            else:
+                break
+
+        return height, cblock
+
+    def stop(self, block=False):
+        """
+        Stop BlockCache
+
+        Arguments:
+            block (bool): If true block until thread has exited
+        """
+        self._stop_event.set()
+        if block:
+            self._fetch_thread.join()
 
 
 
 
-
-
-
-
-
-class BalanceTracker(object):
+class BitcoinBalanceFacade(object):
     """ """
-   
-    def __init__(self, start_height=-1, backtrack_limit=100, proxy=None):
-        # Hash and heigh for the last N blocks
+     
+    def __init__(self, db_session=None, bitcoind_url=None, backtrack_limit=None):
+        """
+        Arguments:
+            db_session (SQLAlchemy.Session)
+            bitcoin_url (string):
+            backtrack_limit (int):
+        """
+        self._db_session = db_session
+        self._bitcoind_url = bitcoind_url or Settings['BITCOIND_URL']
+        self._backtrack_limit = backtrack_limit or Settings['MAX_BACKTRACK_BLOCKS']
+        
+        # Initialize balance 
+        if self._db_session:
+            self._storage = SQLBalanceStorage(Session)
+        else:
+            logger.info("No Database available, using memory storage")
+            self._storage = MemoryBalanceStorage()
+
+        self._balance_storage = BalanceProxyCache(self._storage, Settings['BALANCE_CACHE_SIZE'])
+        
+        # Load initial balance state from DB with the current height
+        self._balance_processor = BalanceProcessor(backtrack_limit=self._backtrack_limit,
+                                                   storage=self._balance_storage)
+
+        # Block cache
+        self._block_cache = BlockPrefetchingCache(self._balance_processor.height+1,
+                                                  self._bitcoind_url) 
+
+        # Connection to bitcoind rpc, it's initialized by reconnect code.
+        self._bitcoind_proxy = BitcoindProxy(self._bitcoind_url)
+
+        # Hash and heigh for the last N blocks added to balance processor
         self._block_hash  = deque()
         self._block_height = deque()
 
-        # Longest backtrack blocks allowed
-        self._backtrack_limit = backtrack_limit
-       
-        # Lock the tracker while the balance is being updated
+        # thread-safe lock during balance updated
         self._lock = threading.Lock()
 
-        #
-        self._block_factory = BlockFactory()
+        # 
+        self._block_factory = BlockFactory(self._bitcoind_proxy)
 
-        # TODO: Load initial state from DB
-        self._balance = BalanceProcessor(backtrack_limit=backtrack_limit)
-        
-        #
-        self._proxy = None
-        self.set_proxy(proxy)
+        # Event to signal threads to stop
+        self._stop_flag = threading.Event()
+
+        # Launch polling thread
+        self._poll_thread = threading.Thread(target=self._poll_thread_func, 
+                                             daemon=False)
+        self._poll_thread.start()
 
     @property
     def height(self):
-        """Return height of top block"""
-        if not self._block_height:
-            return -1
-        else:
-            return self._block_height[-1]
-
-    def set_proxy(self, proxy):
-        self._proxy = proxy
-        self._block_factory.set_proxy(proxy)
-
-    def get_balance(self, address, confirmations):
-        with self._lock:
-            return self._balance.get_balance(address, confirmations)
-
-    def _get_cblock(self, block_height):
-        """Use bitcoind.rpc to get block of given block height
-        
-        Returns:
-            bitcoin.CBlock
-        """
-        if self._proxy is None:
-            raise ConnectionError("Bitcoind proxy not available")
-
-        # Check requested block exists
-        newest_block = self._proxy.getblockcount()
-        if newest_block < block_height:
-            return None
-
-        # Get block
-        blockhash = self._proxy.getblockhash(block_height)
-        return self._proxy.getblock(blockhash)
+        """Return height of top block if there isn't any loaded, used
+        stored balance height"""
+        return self._balance_processor.height
 
     def _add_block(self, block):
         """Add new block to tracked to update balance"""
@@ -110,63 +276,77 @@ class BalanceTracker(object):
             self._block_height.append(block.height)
 
             # Process record into balance
-            self._balance.add_block(block)
+            self._balance_processor.add_block(block)
 
     def _backtrack(self):
         # TODO: Check there are block remainint
         with self._lock:
+            if not self._block_height:
+                logger.error("Backtrack limit reached (height: {})".format(self.height))
+                raise BacktrackError("Backtrack limit reached")
+            else:
+                logger.info("Backtracking one block (height: {})".format(self.height))
+
             self._block_hash.pop()
-            self._block_height.pop()
+            current_height = self._block_height.pop()
             #TODO: Use a better system so there is no need to purge
             # the complete cache each backtrack
-            self._block_factory.purge_cache()
-            self._balance.backtrack()
+            #self._block_factory.purge_cache()
+            self._balance_processor.backtrack()
+            self._block_cache.set_height(current_height)
 
-    def poll_bitcoin(self):
-        """
-        Poll bitcoind for new blocks.
+    def _poll_thread_func(self):
+        """Thread polling bitcoind looking for the next block"""
+        last_update = time.perf_counter()
+        
+        while True:
+            if self._stop_flag.is_set():
+                self._block_cache.stop()
+                break
 
-        Return:
-            (bool) True if there was an update or backtrack, False otherwise
-        """
-        if self._proxy is None:
-            raise ConnectionError("Bitcoind proxy not available")
+            # Wait until the next block is available
+            height, cblock = self._block_cache.get_next_block()
+         
+            # Before building a block check the block follows the current 
+            # top block if not backtrack
+            if self._block_hash and cblock.hashPrevBlock != self._block_hash[-1]:
+                self._backtrack()
+                continue
 
-        try:
-            cblock = self._get_cblock(self.height+1)
-        except (json.JSONDecodeError, ConnectionError) as err:
-            self._proxy = None
-            raise ConnectionError("Bitcoind proxy error")
+            # Construct Block before adding to balance
+            while True:
+                try:
+                    block = self._block_factory.build_block(cblock, height)
+                    break
+                except ConnectionError:
+                    if self._stop_flag.wait(timeout=Settings['BITCOIND_POLL_PERIOD']):
+                        return
+                except Exception as e:
+                    logger.exception("Unexpected exception:")
+                    if self._stop_flag.wait(timeout=Settings['BITCOIND_POLL_PERIOD']):
+                        return
+            
+            if height % 10000 == 0:
+                logger.info("Block {}".format(height))
 
-        if cblock is None: # No new blocks available
-            return False
+            self._add_block(block)
 
-        if not (self.height+1) % 500:
-            logger.info("block {}".format(self.height+1))
-            f = self._block_factory
-            logger.info("cache {} ({} hits | {} miss)".format(len(f._txout_cache), f._cache_hit, f._cache_miss))
-
-        # Before building a block check the block follows the current 
-        # top block if not backtrack
-        if self._block_hash and cblock.hashPrevBlock != self._block_hash[-1]:
-            self._backtrack()
-            return True
-
-        # Fully construct block to asure there won't be a ConnectionError 
-        # during update.
-        try:
-            block = self._block_factory.build_block(cblock, self.height+1)
-        except (json.JSONDecodeError, ConnectionError) as err:
-            self._proxy = None
-            raise ConnectionError("Bitcoind proxy error")
-
-        # Update state with the complete block
-        self._add_block(block)
-        return True
-
-    def stop(self):
+    def stop(self, block=False):
         """Safely stop and record state"""
-        # TODO:
+        self._balance_processor.commit()
+        self._stop_flag.set()
+        self._bitcoind_proxy.stop()
+        if block:
+            self._poll_thread.join()
+        logger.info("Closing")
+
+    def get_balance(self, address):
+        """Get current bitcoin address balance"""
+        with self._lock:
+            return self._balance_processor.get_balance(address)
+
+    def get_transaction(self, address, confirmations=0):
+        #TODO
         pass
 
     def __len__(self):
@@ -175,104 +355,5 @@ class BalanceTracker(object):
 
 
 
-
-
-
-
-
-# -------- Threads and all that stuff --------------
-
-class BitcoinBalanceFacade(object):
-
-    def __init__(self, bitcoind_url='http://user:pass@localhost:8332', start_block=-1):
-        self._bitcoind_url = bitcoind_url
-       
-        # Lock access to BalanceTracker
-        self._lock = threading.Lock()
-        
-        # Event to signal polling thread to stop
-        self._stop_event = threading.Event()
-
-        # Connection to bitcoind service, it's initialized by automatic
-        # reconnect code.
-        self._bitcoind_proxy = None
-
-        self._balance_tracker = BalanceTracker()
-
-        # Load 
-        self._fast_load=True
-
-        self._balance_thread_func() #TODO: Testing
-        # Launch bitcoin polling thread
-        #self._poll_thread = threading.Thread(target=self._balance_thread_func, daemon=False)
-        #self._poll_thread.start()
-
-    def _connect_bitcoind(self):
-        """
-        Try to reconnect to bitcoind server
-
-        Returns:
-            (bool): True if was reconnected false otherwise
-        """
-        try:
-            proxy = bitcoin.rpc.Proxy(service_url=self._bitcoind_url)
-
-            # Check it's a valid connection, bitcoin proxy is lazy and doesn't 
-            # connect until there is a request.
-            count = proxy.getblockcount()
-            self._bitcoind_proxy = proxy
-            self._balance_tracker.set_proxy(proxy)
-            logger.info("Bitcoind connected")
-            return True
-        except (ConnectionError, bitcoin.rpc.InWarmupError) as err:
-            logger.debug("Bitcoind reconnect error: {}".format(err.__class__.__name__))
-            pass
-        except Exception as err:
-            logger.error(err, exc_info=True)
-            raise err
-
-        return False
-
-    def _poll_bitcoin(self):
-        try:
-            return self._balance_tracker.poll_bitcoin()
-        except ConnectionError:
-            self._bitcoind_proxy = None
-            logger.info("Bitcoind connection lost")
-            return False
-
-    def _balance_thread_func(self):
-        last_update = time.perf_counter()
-        
-        while True:
-            stop = self._stop_event.wait(timeout=0.02)
-            if stop:
-                break
-           
-            if time.perf_counter()-last_update < settings['BITCOIND_POLL_PERIOD']:
-                continue
-            else:
-                last_update=time.perf_counter()
-
-            # If bitcoind connection was lost first try to connect 
-            if self._bitcoind_proxy is None:
-                if not self._connect_bitcoind():
-                    continue # Unable to connect
-            
-            # If enabled fast load blockchain
-            if self._fast_load:
-                while self._poll_bitcoin():
-                    continue
-            else:
-                self._poll_bitcoin()
-
-    def stop(self):
-        """Send stop signal to polling thread and wait until it terminated"""
-        self._stop_event.set()
-        self._poll_thread.join()
-
-    def get_balance(address, confirmations):
-        """ """
-        return self._balance_tracker.get_balance(address, confirmations)
 
 

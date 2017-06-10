@@ -82,8 +82,16 @@ celerybeat-schedule
 venv/
 ENV/
 
+# Vim temp files
+*~
+*.swp
+*.swo
+
 # Spyder project settings
 .spyderproject
 
 # Rope project settings
 .ropeproject
+
+# Ignore sqlite db
+*.db

@@ -6,7 +6,18 @@ from bitcoin.wallet import CBitcoinAddress, CBitcoinAddressError
 from bitcoin.rpc import unhexlify, hexlify
 from bitcoin.core import COutPoint
 
+from .exceptions import ChainError, BacktrackError
+
 COINBASE_TX = b'\x00'*32
+
+def bitcoin_to_string(value):
+    """Convert bitcoin value to a string"""
+    #TODO: Append zeroes up to standard length
+    bitcoin_str = str_money_value(abs(value))
+    if value < 0:
+        return '- '+bitcoin_str
+    else:
+        return bitcoin_str
 
 
 
@@ -76,6 +87,13 @@ class TxOut(object):
                     self.addr, 
                     self.value)
 
+    def __str__(self):     
+        return "TxOut({}, {}, {}, {})".format(
+                    b2x(self.tx), 
+                    self.nout, 
+                    self.addr, 
+                    str_money_value(self.value))
+
 
 
 class Block(object):
@@ -129,70 +147,47 @@ class Block(object):
         return input_value == output_value
 
 
-
-class BlockFactory(object):
-
-    def __init__(self, size=1000000, proxy=None):
+class TxOutCache(object):
+    
+    def __init__(self, proxy, size=500000):
         """
         Arguments:
             size (int): max cache size
-            proxy (bitcoin.rpc.Proxy)
+            proxy (proxy.BitcoindProxy)
         """
         self._proxy = proxy
         self._max_size = size
-        
+
         self._txout_cache = OrderedDict()
 
         self._cache_miss = 0
         self._cache_hit = 0
 
-    def set_proxy(self, proxy):
-        self._proxy = proxy
-
-    def _purge_txout(self, txout):
-        """Remove txout from cache
-        Arguments:
-            txout: (TxOut)
-        """
+    def del_txout(self, txout):
+        """Remove txout from cache"""
         self._txout_cache.pop(txout, None)
     
-    def _add_cache(self, txout):
+    def add_txout(self, txout):
         """Add TxOut to cache"""
         if len(self._txout_cache)>=self._max_size:
             self._txout_cache.popitem(last=False)
         
-        self._txout_cache[(txout.tx, txout.nout)] = txout
-
-    def purge_from_cache(self, elem):
-        """Purge TxOut or Block TxOuts from cache"""
-        if isinstance(elem, TxOut):
-            self._purge_txout(self)
-
-        elif isinstance(elem, Block):
-            for out in block.vout:
-                self._purge_txout(out)
-        else:
-            raise TypeError("Received {} only TxOut and Block supported".format(
-                                type(elem)))
+        self._txout_cache[txout] = txout
 
     def purge_cache(self):
-        """Completely purge cache"""
+        """Purge complete cache"""
         self._txout_cache = OrderedDict()
 
-    def _get_txout(self, txhash, nout):
+    def get_txout(self, txhash, nout):
         """
-        Get TxOut from cache if not available query bitcoind
+        Get TxOut from cache or if not available query bitcoind_proxy
         
         Arguments:
             txhash (str): Transactions hash
             nout (int): Output number
         """
-
         try:
-            txout = self._txout_cache[(txhash, nout)]
-
-            # txout is spent remove from cache
-            self.purge_from_cache(txout)
+            txout = self._txout_cache[TxOut(txhash, nout)]
             self._cache_hit += 1
             return txout
         except KeyError:
@@ -200,30 +195,54 @@ class BlockFactory(object):
 
         self._cache_miss += 1
 
-        if not self._proxy:
-            raise  ConnectionError("bitcoin.rpc.proxy not available")
-      
-        rawtx = self._proxy.getrawtransaction(txhash)
-
-        # Add all transaction outputs to cache
-        for out in self._transaction_outputs(rawtx):
-            self._add_cache(out)
+        with self._proxy as proxy: 
+            try:
+                tx = proxy.get_transaction(txhash)
+            except ConnectionError:
+                raise
+            except Exception:
+                raise ChainError("Unknown Txout {} {}".format(txhash, nout))
+ 
+        # Manually initilize TxOut so there is no need to generate the transaction
+        # hash a second time. (faster than:txout = TxOut.from_tx(rawtx, nout))
+        for out, cout in enumerate(tx.vout):
+            addr = TxOut.addr_from_script(cout.scriptPubKey)
+            self.add_txout(TxOut(txhash, out, addr, value=cout.nValue))
 
         # Now txout must be in cache
-        return self._get_txout(txhash, nout)
-        
+        self._cache_hit -= 1 # Fix hit/miss counter
+        return self.get_txout(txhash, nout)
+   
+
+class BlockFactory(object):
+
+    def __init__(self, proxy, size=1000000):
+        """
+        Arguments:
+            size (int): max cache size
+            proxy (proxy.BitcoindProxy)
+        """
+        self._proxy = proxy
+        self._max_size = size
+       
+        self._cache = TxOutCache(proxy, size)
+
+    def purge_cache(self):
+        """Completely purge cache"""
+        self._cache.purge()
+
     def _transaction_inputs(self, tx):
         """Generate transaction inputs from source transaction outputs""" 
         inputs = []
         txhash = tx.GetTxid()
-        
+       
         for vin in tx.vin:
             txin = vin.prevout
             
             if txin.hash == COINBASE_TX:
                 continue
 
-            txout = self._get_txout(txin.hash, txin.n)
+            txout = self._cache.get_txout(txin.hash, txin.n)
             if txout is None:
                 logger.error("Unable to find TxOut {} {}".format(
                         txin_hash, txin_n))
@@ -236,6 +255,7 @@ class BlockFactory(object):
         """Generate transaction TxOut""" 
         outputs = []
 
+        # GetTxid instead of GetHash for segwit support (bip-0141)
         txhash = tx.GetTxid()
 
         for n, utxo in enumerate(tx.vout):  
@@ -253,9 +273,6 @@ class BlockFactory(object):
         for tx in block.vtx:
             block_txouts.extend(self._transaction_outputs(tx))
             
-        for txout in block_txouts:
-            self._add_cache(txout)
-
         return block_txouts
 
     def _block_inputs(self, block):
@@ -270,11 +287,24 @@ class BlockFactory(object):
     def build_block(self, block, height=None):
         """Build Block from bitcoin.CBlock"""
         blockhash = block.GetHash()
-        outputs = self._block_outputs(block)
-        inputs = self._block_inputs(block)
         
+        
+        outputs = self._block_outputs(block)
+        
+        # Add outputs to cache, because the outputs from a transaction
+        # can be used as inputs for other transactions in the same block
+        for txout in outputs:
+            if txout.value > 0:
+                self._cache.add_txout(txout)
+
+        # Generate inputs 
+        inputs = self._block_inputs(block)
+        #TODO: Remove outputs added to cache if input generations fails???
+
+
+        # With the complete block remove used inputs from cache to save space
+        #for txout in inputs:
+        #    self._cache.del_txout(txout)
+
         block = Block(blockhash, height, inputs, outputs)
-        #block.check_balance()
         return block
-
-
